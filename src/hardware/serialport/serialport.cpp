@@ -93,7 +93,83 @@ device_COM::device_COM(class CSerial* sc) {
 device_COM::~device_COM() {
 }
 
+Fifo::Fifo(const size_t n) : q()
+{
+	setSize(n);
+}
 
+bool Fifo::push(const uint8_t val)
+{
+	const auto queued = numQueued();
+	if (queued < max_slots) {
+		q.push(val);
+		if (queued <= slots) {
+			return true;
+		} else {
+			// If we had to stretch the queue, we still return false
+			// to force the sender to back-off. However, our queue
+			// is not corrupt and we can now (hopefully) drain it
+			// before more data arrives.
+			LOG_MSG("SERIAL: stetching %lu-byte FIFO by %lu byte(s) to avoid corruption",
+			        slots, q.size() - slots);
+		}
+	} else {
+		// FIFO has hit the theoretical maximum hardware limit, so we
+		// now deliberately corrupt the end of the queue by replacing
+		// the prior value with this newer value, which matches the
+		// original FIFO behavior.
+		q.back() = val;
+		LOG_MSG("SERIAL: FIFO unable to stretch, max %lu-byte FIFO limit hit",
+		        max_slots);
+	}
+	return false;
+}
+
+void Fifo::clear()
+{
+	q = std::queue<uint8_t>();
+}
+
+uint8_t Fifo::pop()
+{
+	if (isEmpty())
+		return 0;
+	const auto val = q.front();
+	q.pop();
+	return val;
+}
+
+uint8_t Fifo::back()
+{
+	return isEmpty() ? 0 : q.back();
+}
+
+size_t Fifo::numQueued()
+{
+	return q.size();
+}
+
+bool Fifo::isEmpty()
+{
+	return q.empty();
+}
+
+bool Fifo::isFull()
+{
+	return q.size() >= slots;
+}
+
+uint8_t Fifo::front()
+{
+	return isEmpty() ? 0 : q.front();
+}
+
+void Fifo::setSize(const size_t n)
+{
+	assert(n <= max_slots);
+	slots = n;
+	clear();
+}
 
 // COM1 - COM4 objects
 CSerial *serialports[SERIAL_MAX_PORTS] = {nullptr};
@@ -253,7 +329,7 @@ void CSerial::handleEvent(uint16_t type)
 		break;
 
 	case SERIAL_THR_LOOPBACK_EVENT:
-		loopback_data = txfifo->probeByte();
+		loopback_data = txfifo->front();
 		ByteTransmitting();
 		setEvent(SERIAL_TX_LOOPBACK_EVENT, bytetime);
 		break;
@@ -370,13 +446,15 @@ void CSerial::receiveByteEx(uint8_t data, uint8_t error)
 	        data < 0x10 ? "\t\t\t\trx 0x%02x (%" PRIu8 ")" : "\t\t\t\trx 0x%02x (%c)",
 	        data, data);
 #endif
-	if (!(rxfifo->addb(data))) {
+	if (!(rxfifo->push(data))) {
 		// Overrun error ;o
 		error |= LSR_OVERRUN_ERROR_MASK;
 	}
 	removeEvent(SERIAL_RX_TIMEOUT_EVENT);
-	if(rxfifo->getUsage()==rx_interrupt_threshold) rise (RX_PRIORITY);
-	else setEvent(SERIAL_RX_TIMEOUT_EVENT,bytetime*4.0f);
+	if (rxfifo->numQueued() == rx_interrupt_threshold)
+		rise(RX_PRIORITY);
+	else
+		setEvent(SERIAL_RX_TIMEOUT_EVENT, bytetime * 4.0f);
 
 	if(error) {
 		// A lot of UART chips generate a framing error too when receiving break
@@ -390,14 +468,14 @@ void CSerial::receiveByteEx(uint8_t data, uint8_t error)
 			// error and FIFO active
 			if(!errorfifo->isFull()) {
 				errors_in_fifo++;
-				errorfifo->addb(error);
+				errorfifo->push(error);
 			}
 			else {
-				uint8_t toperror = errorfifo->getTop();
+				uint8_t toperror = errorfifo->back();
 				if(!toperror) errors_in_fifo++;
-				errorfifo->addb(error|toperror);
+				errorfifo->push(error | toperror);
 			}
-			if(errorfifo->probeByte()) {
+			if (errorfifo->front()) {
 				// the next byte in the error fifo has an error
 				rise (ERROR_PRIORITY);
 				LSR |= error;
@@ -431,7 +509,7 @@ void CSerial::receiveByteEx(uint8_t data, uint8_t error)
 	} else {
 		// no error
 		if(FCR&FCR_ACTIVATE) {
-			errorfifo->addb(error);
+			errorfifo->push(error);
 		}
 	}
 }
@@ -452,7 +530,7 @@ void CSerial::ByteTransmitting() {
 		//	LOG_MSG("SERIAL: Port %" PRIu8 " FIFO empty when it should not",
 		//	        GetPortNumber());
 		sync_guardtime=false;
-		txfifo->getb();
+		txfifo->pop();
 	}
 	// else
 	// 	LOG_MSG("SERIAL: Port %" PRIu8 " byte transmitting.",
@@ -460,14 +538,13 @@ void CSerial::ByteTransmitting() {
 	if(txfifo->isEmpty())rise (TX_PRIORITY);
 }
 
-
 /*****************************************************************************/
 /* ByteTransmitted: When a byte was sent, notify here.                      **/
 /*****************************************************************************/
 void CSerial::ByteTransmitted () {
 	if(!txfifo->isEmpty()) {
 		// there is more data
-		uint8_t data = txfifo->getb();
+		uint8_t data = txfifo->pop();
 #if SERIAL_DEBUG
 		log_ser(dbg_serialtraffic,data<0x10?
 			"\t\t\t\t\ttx 0x%02x (%" PRIu8 ") (from buffer)":
@@ -503,30 +580,35 @@ void CSerial::Write_THR(uint8_t data)
 
 		if((LSR & LSR_TX_EMPTY_MASK))
 		{	// we were idle before
-			// LOG_MSG("SERIAL: Port %" PRIu8 " starting new transmit cycle", GetPortNumber());
-			// if(sync_guardtime) LOG_MSG("SERIAL: Port %" PRIu8 " internal error 1", GetPortNumber());
-			// if(!(LSR & LSR_TX_EMPTY_MASK)) LOG_MSG("SERIAL: Port %" PRIu8 " internal error 2", GetPortNumber());
-			// if(txfifo->getUsage()) LOG_MSG("SERIAL: Port %" PRIu8 " internal error 3", GetPortNumber());
-			
+			// LOG_MSG("SERIAL: Port %" PRIu8 " starting new
+			// transmit cycle", GetPortNumber()); if(sync_guardtime)
+			// LOG_MSG("SERIAL: Port %" PRIu8 " internal error 1",
+			// GetPortNumber()); if(!(LSR & LSR_TX_EMPTY_MASK))
+			// LOG_MSG("SERIAL: Port %" PRIu8 " internal error 2",
+			// GetPortNumber()); if(txfifo->numQueued())
+			// LOG_MSG("SERIAL: Port %" PRIu8 " internal error 3",
+			// GetPortNumber());
+
 			// need "warming up" time
 			sync_guardtime=true;
 			// block the fifo so it returns THR full (or not in case of FIFO on)
-			txfifo->addb(data); 
+			txfifo->push(data);
 			// transmit shift register is busy
 			LSR &= (~LSR_TX_EMPTY_MASK);
 			if(loopback) setEvent(SERIAL_THR_LOOPBACK_EVENT, bytetime/10);
 			else {
 #if SERIAL_DEBUG
-				log_ser(dbg_serialtraffic, data < 0x10 ?
-				        "\t\t\t\t\ttx 0x%02x (%" PRIu8 ") [FIFO=%2zu]":
-				        "\t\t\t\t\ttx 0x%02x (%c) [FIFO=%2zu]",
-				        data, data, txfifo->getUsage());
+				log_ser(dbg_serialtraffic,
+				        data < 0x10 ? "\t\t\t\t\ttx 0x%02x (%" PRIu8
+				                      ") [FIFO=%2zu]"
+				                    : "\t\t\t\t\ttx 0x%02x (%c) [FIFO=%2zu]",
+				        data, data, txfifo->numQueued());
 #endif
 				transmitByte (data,true);
 			}
 		} else {
 			//  shift register is transmitting
-			if(!txfifo->addb(data)) {
+			if (!txfifo->push(data)) {
 				// TX overflow
 #if SERIAL_DEBUG
 				log_ser(dbg_serialtraffic,"tx overflow");
@@ -549,13 +631,13 @@ uint32_t CSerial::Read_RHR()
 	// 0-7 received data
 	if ((LCR & LCR_DIVISOR_Enable_MASK)) return baud_divider&0xff;
 	else {
-		uint8_t data = rxfifo->getb();
+		uint8_t data = rxfifo->pop();
 		if(FCR&FCR_ACTIVATE) {
-			uint8_t error = errorfifo->getb();
+			uint8_t error = errorfifo->pop();
 			if(error) errors_in_fifo--;
 			// new error
 			if(!rxfifo->isEmpty()) {
-				error=errorfifo->probeByte();
+				error = errorfifo->front();
 				if(error) {
 					LSR |= error;
 					rise(ERROR_PRIORITY);
@@ -565,7 +647,8 @@ uint32_t CSerial::Read_RHR()
 		// Reading RHR resets the FIFO timeout
 		clear (TIMEOUT_PRIORITY);
 		// RX int. is cleared if the buffer holds less data than the threshold
-		if(rxfifo->getUsage()<rx_interrupt_threshold)clear(RX_PRIORITY);
+		if (rxfifo->numQueued() < rx_interrupt_threshold)
+			clear(RX_PRIORITY);
 		removeEvent(SERIAL_RX_TIMEOUT_EVENT);
 		if(!rxfifo->isEmpty()) setEvent(SERIAL_RX_TIMEOUT_EVENT,bytetime*4.0f);
 		return data;
@@ -644,6 +727,8 @@ void CSerial::Write_FCR(uint8_t data)
 		errorfifo->setSize(fifosize);
 		rxfifo->setSize(fifosize);
 		txfifo->setSize(fifosize);
+		DEBUG_LOG_MSG("SERIAL: Port %" PRIu8 " %u-byte FIFO enabled",
+		              GetPortNumber(), fifosize);
 	} else if (BIT_CHANGE_L(FCR, data, FCR_ACTIVATE)) {
 		// FIFO was switched off
 		errors_in_fifo=0;
@@ -651,6 +736,8 @@ void CSerial::Write_FCR(uint8_t data)
 		rxfifo->setSize(1);
 		txfifo->setSize(1);
 		rx_interrupt_threshold=1;
+		DEBUG_LOG_MSG("SERIAL: Port %" PRIu8 " FIFO disabled",
+		              GetPortNumber());
 	}
 	FCR=data&0xCF;
 	if(FCR&FCR_CLEAR_RX) {
@@ -1159,9 +1246,9 @@ CSerial::CSerial(const uint8_t port_idx, CommandLine *cmd)
 #endif
 	fifosize=16;
 
-	errorfifo = new MyFifo(fifosize);
-	rxfifo = new MyFifo(fifosize);
-	txfifo = new MyFifo(fifosize);
+	errorfifo = new Fifo(fifosize);
+	rxfifo = new Fifo(fifosize);
+	txfifo = new Fifo(fifosize);
 
 	mydosdevice=new device_COM(this);
 	DOS_AddDevice(mydosdevice);
