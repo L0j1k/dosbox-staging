@@ -364,16 +364,14 @@ private:
 	uint8_t loopback_data = 0;
 	void transmitLoopbackByte(uint8_t val, bool value);
 
-	// 16C550 (FIFO)
-public: // todo remove
-	Fifo *rxfifo = nullptr;
-
 private:
-	Fifo *txfifo = nullptr;
-	Fifo *errorfifo = nullptr;
+	const uint32_t fifosize = 16; // standard 16-byte FIFO
+	// 16C550 UARTs (FIFOs)
+	Fifo errorfifo;
+	Fifo rxfifo;
+	Fifo txfifo;
 	uint32_t errors_in_fifo = 0;
 	uint32_t rx_interrupt_threshold = 0;
-	uint32_t fifosize = 0;
 	uint8_t FCR = 0;
 	bool sync_guardtime = false;
 
